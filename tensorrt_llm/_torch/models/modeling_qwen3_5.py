@@ -431,11 +431,13 @@ def _normalize_qwen35_moe_vl_config(model_config) -> None:
 def _lm_head_nvfp4_enabled(model_config: ModelConfig) -> bool:
     """Whether the checkpoint's quantized lm_head should stay quantized.
 
-    ModelOpt MIXED_PRECISION exports for Qwen3.5/3.6 quantize lm_head to
-    W4A16_NVFP4 (packed FP4 weight + per-group FP8 scales).  Both the SM100/103
-    NVFP4 (W4A4) Linear path and the SM120 Marlin W4A16 path consume it
-    directly, cutting the lm_head GEMM's weight traffic 4x vs the bf16 dequant
-    fallback -- the decode lm_head is purely weight-bandwidth-bound.
+    ModelOpt MIXED_PRECISION exports for Qwen3.5/3.6/3.8 quantize lm_head to
+    either W4A16_NVFP4 or NVFP4 (both are a packed FP4 weight plus per-group
+    FP8 scales; they differ in the activation precision the GEMM expects).
+    Both are consumed directly by the Linear machinery -- W4A4 through the
+    NVFP4 path, W4A16 through Marlin on SM120 -- cutting the lm_head GEMM's
+    weight traffic 4x vs the bf16 dequant fallback, and the decode lm_head is
+    purely weight-bandwidth-bound.
     Conditions mirror what the quantized LMHead supports (see LMHead.__init__
     guards) plus the paths that bypass the Linear machinery entirely:
 
@@ -458,7 +460,7 @@ def _lm_head_nvfp4_enabled(model_config: ModelConfig) -> bool:
     sm = get_sm_version()
     return (
         cfg is not None
-        and cfg.quant_algo == QuantAlgo.W4A16_NVFP4
+        and cfg.quant_algo in (QuantAlgo.W4A16_NVFP4, QuantAlgo.NVFP4)
         and _has_nvfp4_gemm_block_width(cfg)
         and (is_sm_100f(sm) or is_sm_120f(sm))
         and not getattr(pretrained, "tie_word_embeddings", False)
@@ -592,7 +594,9 @@ def _normalize_qwen35_quant_config_dict(
         if name == "lm_head":
             if keep_lm_head_quant:
                 # _lm_head_nvfp4_enabled only keeps native 16-element paths.
-                # SM120 uses Marlin; SM100/103 promotes to W4A4.
+                # SM100/103 promote a W4A16_NVFP4 entry to W4A4; every other
+                # arch keeps the entry's own algo (W4A16_NVFP4 through Marlin
+                # on SM120, NVFP4 through the W4A4 path).
                 if convert_to_nvfp4 and _has_nvfp4_gemm_block_width(cfg):
                     cfg = cfg.model_copy(update={"quant_algo": QuantAlgo.NVFP4})
                 normalized[name] = cfg
