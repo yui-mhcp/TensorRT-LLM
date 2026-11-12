@@ -42,7 +42,8 @@ from ..llmapi._load_balance_env import (LAUNCH_QUEUES_ENV,
 from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
+from ..llmapi.utils import (_SyncQueue, configure_cpu_affinity, logger_debug,
+                             loading_intra_op_threads)
 from ..sampling_params import SamplingParams
 from .executor import GenerationExecutor
 from .ipc import IpcQueue
@@ -197,7 +198,8 @@ class BaseWorker(GenerationExecutor):
             args["resource_governor_queue"] = self._resource_governor_queue
 
         self.max_seq_len = self.llm_args.max_seq_len
-        self.engine = create_py_executor(**args)
+        with loading_intra_op_threads():
+            self.engine = create_py_executor(**args)
         # Model construction may update the maximum sequence length.
         if self.engine.max_seq_len is not None:
             self.max_seq_len = self.engine.max_seq_len

@@ -16,12 +16,12 @@ import time
 import traceback
 import warnings
 import weakref
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from functools import wraps
 from pathlib import Path
 from queue import Empty, Queue
-from typing import (Any, Callable, ContextManager, Iterable, List, Optional,
-                    Tuple, Type, get_type_hints)
+from typing import (Any, Callable, ContextManager, Iterable, Iterator, List,
+                    Optional, Tuple, Type, get_type_hints)
 
 import filelock
 import huggingface_hub
@@ -778,6 +778,44 @@ def configure_cpu_affinity(device_id: int) -> None:
                 f"Worker process {pid} CPU affinity set to "
                 f"{process.cpu_affinity()} for optimal NUMA-aware scheduling "
                 f"({bound}/{attempted} threads).")
+
+
+_INTRA_OP_THREAD_ENV_VARS = ("OMP_NUM_THREADS", "MKL_NUM_THREADS")
+
+
+@contextmanager
+def loading_intra_op_threads() -> Iterator[None]:
+    """Raise a single-threaded MPI worker's intra-op threads while it loads.
+
+    Under Open MPI, MKL sees the ``OMPI_COMM_WORLD_*`` variables and defaults
+    to a single thread per process, which torch adopts as its intra-op thread
+    count: the CPU tensor work of the checkpoint loading (weight transforms,
+    requantization) then runs on one core. Inside this context, a worker left
+    with one thread and no explicit ``OMP_NUM_THREADS`` / ``MKL_NUM_THREADS``
+    uses the physical cores of its CPU affinity, shared between the ranks of
+    the node. The single thread is restored on exit: serving keeps it, as the
+    spinning OpenMP threads would compete with the executor loop.
+    """
+    if (any(os.environ.get(name) for name in _INTRA_OP_THREAD_ENV_VARS)
+            or torch.get_num_threads() > 1):
+        yield
+        return
+    from tensorrt_llm._utils import local_mpi_size
+
+    cpus = len(os.sched_getaffinity(0))
+    logical = psutil.cpu_count() or cpus
+    physical = psutil.cpu_count(logical=False) or logical
+    num_threads = max(1, cpus * physical // logical // max(1, local_mpi_size()))
+    if num_threads == 1:
+        yield
+        return
+    torch.set_num_threads(num_threads)
+    logger.info(f"Worker process {os.getpid()} loads with {num_threads} "
+                "intra-op threads.")
+    try:
+        yield
+    finally:
+        torch.set_num_threads(1)
 
 
 def generate_api_docs_as_docstring(model: Type[BaseModel],
