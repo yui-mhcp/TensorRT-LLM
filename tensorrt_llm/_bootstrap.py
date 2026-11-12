@@ -51,6 +51,7 @@ _TRTLLM_DG_CACHE_ENV = "TRTLLM_DG_CACHE_DIR"
 _TRTLLM_DG_DUMP_CUBIN_ENV = "TRTLLM_DG_JIT_DUMP_CUBIN"
 _UNIFIED_CACHE_ENV_VARS = (
     "TLLM_AUTOTUNER_CACHE_PATH",
+    "TLLM_KV_CACHE_CAPACITY_CACHE_PATH",
     "TORCHINDUCTOR_CACHE_DIR",
     "TRITON_CACHE_DIR",
     "TORCH_EXTENSIONS_DIR",
@@ -67,6 +68,9 @@ def _unified_cache_defaults(cache_root: str) -> dict[str, str]:
     cache_root = os.path.expanduser(cache_root)
     return {
         "TLLM_AUTOTUNER_CACHE_PATH": os.path.join(cache_root, "autotuner", "cache.json"),
+        "TLLM_KV_CACHE_CAPACITY_CACHE_PATH": os.path.join(
+            cache_root, "kv_cache_capacity", "cache.json"
+        ),
         "TORCHINDUCTOR_CACHE_DIR": os.path.join(cache_root, "inductor"),
         "TRITON_CACHE_DIR": os.path.join(cache_root, "triton"),
         "TORCH_EXTENSIONS_DIR": os.path.join(cache_root, "torch_extensions"),

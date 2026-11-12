@@ -68,6 +68,7 @@ from .engine.lora import make_lora_model_config
 from .engine.multimodal import is_multimodal, use_mrope
 from .guided_decoder import GuidedDecoder
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from .kv_cache_capacity_cache import KvCacheCapacityCache
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            CppMambaHybridCacheManager,
                                            MambaHybridCacheManagerV2,
@@ -1020,6 +1021,10 @@ class KvCacheCreator:
         # covers, computed in configure_kv_cache_capacity and carried to the KV manager so the scheduler
         # reads it directly instead of re-deriving it from pool layout. None until reserved (or w == 0).
         self._fp8_ctx_mla_kv_len_cap = None
+        # On-disk cache of the estimated budget (see kv_cache_capacity_cache),
+        # and the cached budget used instead of an estimation.
+        self._capacity_cache: Optional[KvCacheCapacityCache] = None
+        self._cached_kv_cache_max_memory: Optional[int] = None
 
     def _get_model_kv_cache_manager_cls(
         self,
@@ -1698,6 +1703,15 @@ class KvCacheCreator:
         if self._skip_est:
             return False
 
+        self._capacity_cache = self._open_capacity_cache()
+        if self._capacity_cache is not None:
+            self._cached_kv_cache_max_memory = self._capacity_cache.lookup()
+            if self._cached_kv_cache_max_memory is not None:
+                # build_managers() then applies the cached budget through
+                # configure_kv_cache_capacity().
+                self._skip_est = True
+                return False
+
         estimating_kv_cache = True
         if 'cp_type' in self._mapping.cp_config:
             estimating_kv_cache = False
@@ -1759,6 +1773,39 @@ class KvCacheCreator:
             else:
                 self._kv_cache_config.max_tokens = max_tokens
         return estimating_kv_cache
+
+    def _open_capacity_cache(self) -> Optional[KvCacheCapacityCache]:
+        """The on-disk cache of the estimated budget, if the config supports it.
+
+        Only the single-rank V2-manager configurations without a separate draft
+        cache, connector, context parallelism, sparse attention or cross
+        attention are cached: their estimation only yields max_gpu_total_bytes.
+        """
+        model_config = self._model_engine.model.model_config
+        if (not self._is_kv_cache_manager_v2 or self._mapping.world_size != 1
+                or 'cp_type' in self._mapping.cp_config or self._is_disagg
+                or self._kv_connector_manager is not None
+                or self._sparse_attention_config is not None
+                or self._should_create_separate_draft_kv_cache()
+                or getattr(model_config, "is_encoder_decoder", False)
+                or model_config.attn_backend == "VANILLA"):
+            return None
+        _, total_bytes = torch.cuda.mem_get_info()
+        return KvCacheCapacityCache.from_env({
+            "tensorrt_llm": tensorrt_llm.__version__,
+            "torch": torch.__version__,
+            "device": torch.cuda.get_device_name(),
+            "total_bytes": total_bytes,
+            "model_bytes": torch.cuda.memory_allocated(),
+            "pretrained_config": model_config.pretrained_config.to_dict(),
+            "llm_args": self._llm_args.model_dump(mode="json"),
+            "kv_cache_config": self._kv_cache_config.model_dump(mode="json"),
+            "limits": [
+                self._max_batch_size, self._max_num_tokens, self._max_seq_len,
+                self._net_max_seq_len, self._max_beam_width,
+                self._tokens_per_block
+            ],
+        })
 
     def _configure_helix_kv_cache_capacity(self) -> None:
         """Set the helix KV quota without profiling (not CP-aware).
@@ -1826,6 +1873,17 @@ class KvCacheCreator:
             self._configure_helix_kv_cache_capacity()
             return
         assert 'cp_type' not in mapping.cp_config
+
+        if self._cached_kv_cache_max_memory is not None:
+            kv_cache_max_memory = self._cached_kv_cache_max_memory
+            if (self._max_gpu_total_bytes_in is not None
+                    and self._max_gpu_total_bytes_in > 0):
+                kv_cache_max_memory = min(kv_cache_max_memory,
+                                          self._max_gpu_total_bytes_in)
+            self._kv_cache_config.max_gpu_total_bytes = kv_cache_max_memory
+            logger.info("Cached max memory in KV cache : "
+                        f"{kv_cache_max_memory / (GB):.2f} GiB")
+            return
 
         fraction = self._kv_cache_config.free_gpu_memory_fraction
 
@@ -2091,6 +2149,10 @@ class KvCacheCreator:
         )
         # set max_gpu_total_bytes
         self._kv_cache_config.max_gpu_total_bytes = kv_cache_max_memory
+        if (self._capacity_cache is not None and py_executor is not None
+                and not self._skip_est
+                and self._fp8_ctx_mla_kv_len_cap is None):
+            self._capacity_cache.store(kv_cache_max_memory)
         if isinstance(self._profiling_stage_data, dict):
             self._profiling_stage_data["activation_bytes"] = activation_bytes
         # ---------------------------handle max_gpu_total_bytes---------------------------------

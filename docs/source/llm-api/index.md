@@ -213,6 +213,7 @@ configured environment variable takes precedence.
 | Environment variable | Default cache path | Default under `TRTLLM_CACHE_DIR` |
 |----------------------|--------------------|------------------------------------|
 | `TLLM_AUTOTUNER_CACHE_PATH` | Disabled | `autotuner/cache.json` |
+| `TLLM_KV_CACHE_CAPACITY_CACHE_PATH` | Disabled | `kv_cache_capacity/cache.json` |
 | `TORCHINDUCTOR_CACHE_DIR` | `/tmp/torchinductor_$USER` | `inductor` |
 | `TRITON_CACHE_DIR` | `$HOME/.triton/cache` | `triton` |
 | `TORCH_EXTENSIONS_DIR` | `$HOME/.cache/torch_extensions` | `torch_extensions` |
