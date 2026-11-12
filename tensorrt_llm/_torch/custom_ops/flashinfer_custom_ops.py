@@ -12,6 +12,11 @@ if IS_FLASHINFER_AVAILABLE:
                                  rmsnorm)
     from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
 
+    from ..cute_dsl_kernel_cache import \
+        install as _install_cute_dsl_kernel_cache
+
+    _install_cute_dsl_kernel_cache()
+
     # Warp this into custom op since flashinfer didn't warp it properly and we want to avoid graph break between mlp layer for user buffer optimization
     @torch.library.custom_op("trtllm::flashinfer_silu_and_mul", mutates_args=())
     def flashinfer_silu_and_mul(x: torch.Tensor) -> torch.Tensor:
