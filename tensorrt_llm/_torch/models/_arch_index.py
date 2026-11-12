@@ -127,6 +127,7 @@ MODEL_ARCH_TO_MODULE = {
     "Step3p7ForConditionalGeneration": "modeling_step3p7vl",
     "T5ForConditionalGeneration": "modeling_t5",
     "WhisperForConditionalGeneration": "modeling_whisper",
+    "XLMRobertaModel": "modeling_xlm_roberta",
 }
 
 # Public class name exported by ``tensorrt_llm._torch.models`` -> providing module.

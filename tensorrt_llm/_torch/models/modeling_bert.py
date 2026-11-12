@@ -334,54 +334,65 @@ class BertForSequenceClassification(nn.Module):
         self.half()
 
 
-def convert_bert_to_tllm(bert_state_dict, num_layers):
+def convert_bert_to_tllm(bert_state_dict, num_layers, prefix='bert.'):
     """
     Convert a standard BERT-style state_dict to a TLLM-style state_dict.
+
+    ``prefix`` is the backbone prefix of the checkpoint keys: ``'bert.'`` for
+    ``BertFor*`` heads, ``''`` for a bare encoder checkpoint (e.g.
+    ``XLMRobertaModel``). The classifier is only mapped when present.
     """
     tllm_state_dict = {}
+    bert_state_dict = {
+        k[len(prefix):]: v
+        for k, v in bert_state_dict.items() if k.startswith(prefix)
+    } | {
+        k: v
+        for k, v in bert_state_dict.items() if k.startswith('classifier.')
+    }
 
     # ----- 1) Embeddings -----
     # BERT -> TLLM
 
     tllm_state_dict['model.embedding.word_embeddings'] = [{
         'weight':
-        bert_state_dict['bert.embeddings.word_embeddings.weight']
+        bert_state_dict['embeddings.word_embeddings.weight']
     }]
     tllm_state_dict['model.embedding.position_embeddings'] = [{
         'weight':
-        bert_state_dict['bert.embeddings.position_embeddings.weight']
+        bert_state_dict['embeddings.position_embeddings.weight']
     }]
     tllm_state_dict['model.embedding.token_type_embeddings'] = [{
         'weight':
-        bert_state_dict['bert.embeddings.token_type_embeddings.weight']
+        bert_state_dict['embeddings.token_type_embeddings.weight']
     }]
 
     # BERT embedding LayerNorm has both weight and bias
     tllm_state_dict['model.embedding.embedding_ln'] = [{
         'weight':
-        bert_state_dict['bert.embeddings.LayerNorm.weight'],
+        bert_state_dict['embeddings.LayerNorm.weight'],
         'bias':
-        bert_state_dict['bert.embeddings.LayerNorm.bias']
+        bert_state_dict['embeddings.LayerNorm.bias']
     }]
 
     # ----- 2) Map each Transformer layer -----
     for i in range(num_layers):
         # (a) QKV: BERT has separate query/key/value
         q_w = bert_state_dict[
-            f'bert.encoder.layer.{i}.attention.self.query.weight']
+            f'encoder.layer.{i}.attention.self.query.weight']
         q_b = bert_state_dict[
-            f'bert.encoder.layer.{i}.attention.self.query.bias']
+            f'encoder.layer.{i}.attention.self.query.bias']
         q = {'weight': q_w, 'bias': q_b}
 
         k_w = bert_state_dict[
-            f'bert.encoder.layer.{i}.attention.self.key.weight']
-        k_b = bert_state_dict[f'bert.encoder.layer.{i}.attention.self.key.bias']
+            f'encoder.layer.{i}.attention.self.key.weight']
+        k_b = bert_state_dict[f'encoder.layer.{i}.attention.self.key.bias']
         k = {'weight': k_w, 'bias': k_b}
 
         v_w = bert_state_dict[
-            f'bert.encoder.layer.{i}.attention.self.value.weight']
+            f'encoder.layer.{i}.attention.self.value.weight']
         v_b = bert_state_dict[
-            f'bert.encoder.layer.{i}.attention.self.value.bias']
+            f'encoder.layer.{i}.attention.self.value.bias']
         v = {'weight': v_w, 'bias': v_b}
         res = [q, k, v]
 
@@ -390,9 +401,9 @@ def convert_bert_to_tllm(bert_state_dict, num_layers):
         # (b) Output projection in attention
 
         o_w = bert_state_dict[
-            f'bert.encoder.layer.{i}.attention.output.dense.weight']
+            f'encoder.layer.{i}.attention.output.dense.weight']
         o_b = bert_state_dict[
-            f'bert.encoder.layer.{i}.attention.output.dense.bias']
+            f'encoder.layer.{i}.attention.output.dense.bias']
         tllm_state_dict[f'model.layers.{i}.self_attn.o_proj'] = [{
             'weight': o_w,
             'bias': o_b
@@ -407,18 +418,18 @@ def convert_bert_to_tllm(bert_state_dict, num_layers):
         #   - `post_layernorm` (after attention, before MLP), etc.
 
         ln_in_w = bert_state_dict[
-            f'bert.encoder.layer.{i}.attention.output.LayerNorm.weight']
+            f'encoder.layer.{i}.attention.output.LayerNorm.weight']
         ln_in_b = bert_state_dict[
-            f'bert.encoder.layer.{i}.attention.output.LayerNorm.bias']
+            f'encoder.layer.{i}.attention.output.LayerNorm.bias']
         tllm_state_dict[f'model.layers.{i}.input_layernorm'] = [{
             'weight': ln_in_w,
             'bias': ln_in_b
         }]
 
         ln_out_w = bert_state_dict[
-            f'bert.encoder.layer.{i}.output.LayerNorm.weight']
+            f'encoder.layer.{i}.output.LayerNorm.weight']
         ln_out_b = bert_state_dict[
-            f'bert.encoder.layer.{i}.output.LayerNorm.bias']
+            f'encoder.layer.{i}.output.LayerNorm.bias']
         tllm_state_dict[f'model.layers.{i}.post_layernorm'] = [{
             'weight': ln_out_w,
             'bias': ln_out_b
@@ -431,16 +442,16 @@ def convert_bert_to_tllm(bert_state_dict, num_layers):
         # In a *very naive* 1:1 mapping:
 
         fc1_w = bert_state_dict[
-            f'bert.encoder.layer.{i}.intermediate.dense.weight']
+            f'encoder.layer.{i}.intermediate.dense.weight']
         fc1_b = bert_state_dict[
-            f'bert.encoder.layer.{i}.intermediate.dense.bias']
+            f'encoder.layer.{i}.intermediate.dense.bias']
         tllm_state_dict[f'model.layers.{i}.mlp.fc1'] = [{
             'weight': fc1_w,
             'bias': fc1_b
         }]
 
-        fc2_w = bert_state_dict[f'bert.encoder.layer.{i}.output.dense.weight']
-        fc2_b = bert_state_dict[f'bert.encoder.layer.{i}.output.dense.bias']
+        fc2_w = bert_state_dict[f'encoder.layer.{i}.output.dense.weight']
+        fc2_b = bert_state_dict[f'encoder.layer.{i}.output.dense.bias']
         tllm_state_dict[f'model.layers.{i}.mlp.fc2'] = [{
             'weight': fc2_w,
             'bias': fc2_b
@@ -448,17 +459,18 @@ def convert_bert_to_tllm(bert_state_dict, num_layers):
 
     # ----- 3) Pooler (if present in TLLM) -----
 
-    if 'bert.pooler.dense.weight' in bert_state_dict:
-        pooler_w = bert_state_dict['bert.pooler.dense.weight']
-        pooler_b = bert_state_dict['bert.pooler.dense.bias']
+    if 'pooler.dense.weight' in bert_state_dict:
+        pooler_w = bert_state_dict['pooler.dense.weight']
+        pooler_b = bert_state_dict['pooler.dense.bias']
         tllm_state_dict['model.pooler.dense'] = [{
             'weight': pooler_w,
             'bias': pooler_b
         }]
 
     # ----- 4) Classifier (if present) -----
-    cls_w = bert_state_dict['classifier.weight']
-    cls_b = bert_state_dict['classifier.bias']
-    tllm_state_dict['classifier'] = [{'weight': cls_w, 'bias': cls_b}]
+    if 'classifier.weight' in bert_state_dict:
+        cls_w = bert_state_dict['classifier.weight']
+        cls_b = bert_state_dict['classifier.bias']
+        tllm_state_dict['classifier'] = [{'weight': cls_w, 'bias': cls_b}]
 
     return tllm_state_dict

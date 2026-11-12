@@ -125,5 +125,6 @@ PUBLIC_MODEL_ARCHITECTURES = frozenset(
         "Step3p7ForConditionalGeneration",
         "T5ForConditionalGeneration",
         "WhisperForConditionalGeneration",
+        "XLMRobertaModel",
     }
 )
