@@ -60,6 +60,7 @@ from ..moe.fused_moe.moe_load_balancer import (BaseMoeLoadBalancer,
                                                maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
+from .weight_snapshot import WeightSnapshot
 from .config_utils import (is_hybrid_linear, is_minimax_m3, is_mla,
                            resolve_auto_ssm_cache_dtype,
                            supports_fp4_mla_attention, uses_fp4_mla_attention,
@@ -2286,6 +2287,19 @@ class ModelLoader:
                                         checkpoint_dir: str, model, config,
                                         load_weights_kwargs: dict) -> bool:
         """Keep loader-specific work alive through weight materialization."""
+        snapshot = (WeightSnapshot.from_env(model=model,
+                                            checkpoint_dir=checkpoint_dir,
+                                            config=config,
+                                            mapping=self.mapping)
+                    if checkpoint_loader.checkpoint_format == "HF" else None)
+        if snapshot is not None and snapshot.exists:
+            self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
+                model, config)
+            with timing_metric(
+                    ModelLoaderMetricNames.WEIGHT_POPULATION_SECONDS.value,
+                    self._metrics):
+                if snapshot.restore(model):
+                    return False
         with _timed_checkpoint_weight_session(
                 checkpoint_loader, checkpoint_dir, self._metrics,
                 ModelLoaderMetricNames.CHECKPOINT_PREPARATION_SECONDS.value,
@@ -2301,6 +2315,8 @@ class ModelLoader:
                 **load_weights_kwargs,
             )
             if weights:
+                if snapshot is not None and not weights_preloaded:
+                    snapshot.begin_capture(model)
                 with timing_metric(
                         ModelLoaderMetricNames.WEIGHT_POPULATION_SECONDS.value,
                         self._metrics):
@@ -2308,6 +2324,8 @@ class ModelLoader:
                                             self.weight_mapper)
                     if torch.cuda.is_available():  # CPU guard
                         torch.cuda.synchronize()
+                if snapshot is not None and not weights_preloaded:
+                    snapshot.end_capture(model)
         return weights_preloaded
 
     def _materialize_draft_checkpoint_weights(self, checkpoint_loader,

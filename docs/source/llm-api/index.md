@@ -364,6 +364,22 @@ ranks; populate it before the multi-rank launch, either by installing the
 warm-up run, and set `FLASHINFER_NO_DOWNLOAD=1` so a missing artifact fails
 instead of being downloaded concurrently into the shared directory.
 
+## Weight Snapshot
+
+Set `TLLM_WEIGHT_SNAPSHOT_DIR` to skip the checkpoint weight processing of the
+PyTorch backend on later starts. The first load of a Hugging Face checkpoint
+saves, under this directory, the model state right after its weight loading
+(the mapped, fused, requantized tensors and the module attributes the loading
+set); later loads copy it into the model instead of reading and transforming the
+checkpoint. The post-load hooks run on both paths.
+
+A snapshot is keyed by the TensorRT-LLM, PyTorch, FlashInfer and CuTe DSL
+versions, the weight-loading sources, the checkpoint files, the model and
+quantization configurations, the mapping and the layout of the constructed
+model; a new snapshot of a checkpoint replaces its stale ones. It takes about
+the size of the model weights on disk. A model whose loading leaves a module
+attribute without a snapshot encoding is never snapshotted.
+
 ## Tips and Troubleshooting
 
 The following tips typically assist new LLM API users who are familiar with other APIs that are part of TensorRT-LLM:
