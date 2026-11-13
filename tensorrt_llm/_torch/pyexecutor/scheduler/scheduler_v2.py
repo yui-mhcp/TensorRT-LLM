@@ -678,6 +678,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         # itself a started context request still sits in pending_ctx, so
         # re-admitting it would spend the pages its own preemption released.
         preempted_ids: set[int] = set()
+        # Whether a context request of this pass was left without the pages it
+        # asked for.
+        ctx_out_of_pages = False
 
         # Long-prefill demotion (see __init__). Reorder here rather than on
         # requests_list: phase 1 walks that list by index, pending_ctx is this
@@ -688,16 +691,21 @@ class KVCacheV2Scheduler(RequestScheduler):
             pending_ctx, demoted_ids = self._defer_long_context(pending_ctx)
 
         def preempt_for_pages(req: LlmRequest) -> bool:
-            """Free pages for `req` by giving up one started request.
+            """Free pages for `req` by suspending or giving up one started request.
 
             A success ends the phase 2 loop, reserving the pages for the
-            request that paid a re-prefill for them. Letting a later context
-            request take them instead would leave `req` preempting again every
-            pass without ever being admitted.
+            request that paid a suspension or a re-prefill for them. Letting a
+            later context request take them instead would leave `req`
+            reclaiming again every pass without ever being admitted.
             """
+            nonlocal ctx_out_of_pages
             protected = {r.py_request_id for r in scheduled_gen}
             protected.update(r.py_request_id for r in scheduled_ctx)
             protected.add(req.py_request_id)
+            # A request this pass already suspended or recompute-paused has
+            # given up what it can for now.
+            protected.update(r.py_request_id for r in evicted)
+            protected.update(r.py_request_id for r in recompute_paused)
             # Demotion reorders compute, not page priority: a demoted request
             # that arrived before `req` would have been scheduled, and so
             # protected, ahead of it in FCFS order.
@@ -707,14 +715,19 @@ class KVCacheV2Scheduler(RequestScheduler):
                         break
                     if other.py_request_id in demoted_ids:
                         protected.add(other.py_request_id)
-            return self._try_preempt_for_pages(
+            requester_idx = pending_ctx_index[req.py_request_id]
+            reclaimed = self._try_suspend_for_pages(
+                requests_list, protected, inflight_request_ids, evicted, requester_idx
+            ) or self._try_preempt_for_pages(
                 requests_list,
                 protected,
                 inflight_request_ids,
                 recompute_paused,
                 preempted_ids,
-                pending_ctx_index[req.py_request_id],
+                requester_idx,
             )
+            ctx_out_of_pages = ctx_out_of_pages or not reclaimed
+            return reclaimed
 
         # --- Phase 2: schedule deferred context / encoder requests ---
         # Generation PEFT pages are now fully committed in the budget.
@@ -805,6 +818,13 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if scheduled_ctx and self._first_chunk_waits_for_budget(req, budget):
                     continue
                 if req.py_request_id in preempted_ids:
+                    continue
+                if ctx_out_of_pages and self._is_suspended_to_lower_tier(req):
+                    # Resuming it would take back the pages an older request
+                    # is waiting for. When the lower tier is full those pages
+                    # never left the GPU, so the resume would even succeed,
+                    # and the older request would suspend it again on every
+                    # pass instead of stalling into the preemption fallback.
                     continue
                 remote_mode = getattr(req, "py_csa2_remote_tail_mode", None)
                 if defer_remote_tail_context and remote_mode is not None:
@@ -1344,6 +1364,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         # before budget check.
         if not self._prepare_context_pair(req):
             logger.debug(f"prepare_context failed for context request {req.py_request_id}")
+            self._reclaim_for_resume(req, preempt_for_pages)
             return ScheduleAction.STOP, 0, False
 
         context_tokens = req.context_remaining_length
@@ -1364,9 +1385,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         # prepareResources for main cache), so include draft tokens.
         req.context_chunk_size = context_tokens
         if not self._try_allocate_context(req, context_tokens + draft_len):
-            # Out of pages. Give up one started request so this one can
-            # proceed, and retry next iteration: a failed resize leaves a
-            # first chunk suspended, so the retry has to go back through
+            # Out of pages. Suspend or give up one started request so this
+            # one can proceed, and retry next iteration: a failed resize leaves
+            # a first chunk suspended, so the retry has to go back through
             # prepare_context to resume it.
             if preempt_for_pages(req):
                 return ScheduleAction.STOP, 0, False
@@ -1415,6 +1436,22 @@ class KVCacheV2Scheduler(RequestScheduler):
             return req.context_remaining_length > remaining
         return self._uncached_tokens(req) > remaining and not self._holds_context_cache(req)
 
+    def _reclaim_for_resume(
+        self, req: LlmRequest, preempt_for_pages: Callable[[LlmRequest], bool]
+    ) -> bool:
+        """Free GPU pages for a suspended mid-prefill request that could not resume.
+
+        With a cache tier below GPU, a context request suspended between two
+        chunks can find its GPU pages taken by newer requests. Like a failed
+        resize, reclaim them from a newer started request, so the older one is
+        not left waiting behind requests that may be waiting for pages too.
+        """
+        return (
+            self.kv_cache_manager.has_cache_tier_below_gpu
+            and not req.is_first_context_chunk
+            and preempt_for_pages(req)
+        )
+
     def _try_schedule_context_chunked(
         self,
         req: LlmRequest,
@@ -1445,6 +1482,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Prepare context (create _KVCache, block reuse, resume — no resize)
         if not self._prepare_context_pair(req):
             logger.debug(f"prepare_context failed for chunked context request {req.py_request_id}")
+            if self._reclaim_for_resume(req, preempt_for_pages):
+                return ScheduleAction.STOP, 0, False
             return ScheduleAction.SKIP, 0, False
 
         # Calculate chunk size from remaining budget
@@ -2120,6 +2159,60 @@ class KVCacheV2Scheduler(RequestScheduler):
     def _clear_request_runtime_state(self, req: LlmRequest) -> None:
         req.py_batch_idx = None
 
+    def _is_suspended_to_lower_tier(self, req: LlmRequest) -> bool:
+        """A started context request whose pages were handed to a lower tier."""
+        return (
+            self.kv_cache_manager.has_cache_tier_below_gpu
+            and req.state_value == self._context_init_state_value
+            and not req.is_first_context_chunk
+            and not self.kv_cache_manager.is_request_active(req.py_request_id)
+        )
+
+    def _try_suspend_for_pages(
+        self,
+        requests_list: RequestList,
+        protected_ids: set[int],
+        inflight_request_ids: set[int],
+        evicted: RequestList,
+        requester_idx: int,
+    ) -> bool:
+        """Suspend one newer started request so a context request can allocate.
+
+        The context-side counterpart of `_try_evict_for_gen`. With a cache
+        tier below GPU a suspended request's pages migrate one level down, so
+        the victim keeps its prefill and resumes once the pages come back.
+        Without one, suspension frees nothing and `_try_preempt_for_pages` is
+        the only way to make room.
+
+        Only requests behind the requester are taken, newest first: an older
+        victim would retake the pages on its next pass, whether through this
+        path or through `_try_evict_for_gen`, and the two requests would
+        suspend each other forever. A blocked request with nothing behind it
+        waits for the older ones instead.
+
+        Returns True when a request was suspended in this iteration.
+        """
+        if not self.kv_cache_manager.has_cache_tier_below_gpu:
+            return False
+        for i in range(len(requests_list) - 1, requester_idx, -1):
+            victim = requests_list[i]
+            if victim.py_request_id in protected_ids:
+                continue
+            # A request that is completing releases its pages by itself.
+            if victim.state_value == self._gen_to_complete_state_value:
+                continue
+            if not self._is_evictable(victim, inflight_request_ids):
+                continue
+            logger.debug(
+                f"[V2Scheduler] Suspending request {victim.py_request_id} "
+                f"(state={victim.state.name}) to free pages for context request "
+                f"{requests_list[requester_idx].py_request_id}"
+            )
+            self._suspend_request(victim)
+            evicted.append(victim)
+            return True
+        return False
+
     def _try_preempt_for_pages(
         self,
         requests_list: RequestList,
@@ -2133,7 +2226,11 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         The fallback for a pool that suspension cannot drain; see
         `KVCacheManagerV2.preempt_request`. With a cache tier below GPU,
-        suspension is cheaper and keeps the pages, so that path is left alone.
+        `_try_suspend_for_pages` runs first, and this only takes over once no
+        newer request is left to suspend, no active generation request is
+        about to return its pages and a whole scheduling pass has stalled:
+        the suspended pages are then stuck on GPU, typically because the
+        lower tier is full.
 
         The victim leaves on `recompute_paused`, the same channel the
         generation side uses, because a re-prefill needs more teardown than the
@@ -2144,8 +2241,18 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         Returns True when pages became available in this iteration.
         """
-        if self.kv_cache_manager.has_cache_tier_below_gpu:
-            return False
+        has_lower_tier = self.kv_cache_manager.has_cache_tier_below_gpu
+        if has_lower_tier:
+            # Pages may still come back without a re-prefill: wait while
+            # another request makes progress, and while an active generation
+            # request holds GPU pages, which it returns when it finishes or
+            # when its own failed allocation suspends it.
+            if self._stalled_schedules == 0 or any(
+                r.is_generation_in_progress_state
+                and self.kv_cache_manager.is_request_active(r.py_request_id)
+                for r in requests_list
+            ):
+                return False
         # A disaggregated generation worker received its context KV rather
         # than computing it, so it cannot replay a prefill at all.
         if not self.enable_recompute_pause:
@@ -2154,7 +2261,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Newest first, so the requests closest to completing keep their
         # pages and the pool drains instead of thrashing.
         stop = -1
-        if self.has_cp_helix:
+        if self.has_cp_helix or has_lower_tier:
             # Only requests behind the requester, as the generation ladder
             # does: an older victim would retake the pages on the next pass
             # and preempt the requester in turn.
@@ -2165,7 +2272,13 @@ class KVCacheV2Scheduler(RequestScheduler):
                 continue
             if not self._is_recompute_pause_candidate(victim, inflight_request_ids):
                 continue
-            if not self.kv_cache_manager.is_request_active(victim.py_request_id):
+            # Without a lower tier a suspended request holds no page worth
+            # taking. With one, every active request behind the requester was
+            # suspended first, so the candidates left are suspended requests
+            # whose pages could not leave the GPU.
+            if not has_lower_tier and not self.kv_cache_manager.is_request_active(
+                victim.py_request_id
+            ):
                 continue
 
             if not self._preempt_or_defer(victim, recompute_paused):
@@ -2317,6 +2430,15 @@ class KVCacheV2Scheduler(RequestScheduler):
                 "kv_cache_config.max_tokens or "
                 "kv_cache_config.free_gpu_memory_fraction, or lower "
                 "max_num_tokens to hand memory back to the KV pool."
+            )
+        elif self.kv_cache_manager.has_cache_tier_below_gpu:
+            # Suspension and preemption both ran out of requests to take, so
+            # the blocked request does not fit by itself.
+            remedy = (
+                "A single request may not fit the GPU pool, or the host tier "
+                "may be full: increase kv_cache_config.free_gpu_memory_fraction, "
+                "max_tokens or host_cache_size, raise avg_seq_len for a hybrid "
+                "model with long prompts, or lower max_batch_size."
             )
         else:
             remedy = (

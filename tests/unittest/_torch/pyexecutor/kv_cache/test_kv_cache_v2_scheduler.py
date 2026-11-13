@@ -2204,12 +2204,12 @@ class TestContextPreemption:
                 id="a_disagg_generation_worker_received_its_context_kv",
             ),
             pytest.param(
-                {"has_cache_tier_below_gpu": True},
+                {"has_cache_tier_below_gpu": True, "can_evict": True},
                 {},
                 _blocked_and_victim,
                 set(),
-                # Skipped rather than released: suspension keeps the pages.
-                {"context_requests": [99]},
+                # Suspended rather than released: suspension keeps the pages.
+                {"paused_requests": [99], "context_requests": []},
                 id="a_cache_tier_exists_below_gpu",
             ),
             pytest.param(
@@ -2335,6 +2335,312 @@ class TestContextPreemption:
 
         mgr.preempt_request.assert_called_once_with(victim)
         assert ids(out.recompute_paused_requests) == [99]
+
+
+def _make_gpu_pool(capacity, held):
+    """prepare_context / resize_context sharing *capacity* tokens of GPU pages.
+
+    *held* maps a request id to the tokens it holds. Only active requests
+    count against the pool: a suspended one has its pages in the lower tier
+    and resumes once they fit again.
+    """
+    managers = []
+
+    def used(mgr):
+        return sum(tokens for rid, tokens in held.items() if mgr.kv_cache_map[rid].is_active)
+
+    def prepare_context(req, reuse_limit=None):
+        (mgr,) = managers
+        kv_cache = mgr.kv_cache_map[req.py_request_id]
+        if not kv_cache.is_active:
+            if used(mgr) + held.get(req.py_request_id, 0) > capacity:
+                return False
+            kv_cache.is_active = True
+        return True
+
+    def resize_context(req, num_tokens):
+        (mgr,) = managers
+        if used(mgr) + num_tokens > capacity:
+            return False
+        held[req.py_request_id] = held.get(req.py_request_id, 0) + num_tokens
+        return True
+
+    return managers, prepare_context, resize_context
+
+
+def _started_context(request_id, remaining=64):
+    return make_ctx_request(request_id, remaining, prompt_len=128, is_first_context_chunk=False)
+
+
+class TestContextSuspension:
+    """Suspending a newer started request when a lower cache tier can take its pages.
+
+    The context-side counterpart of the generation eviction: without it, two
+    prefills that fill the GPU pool together wait for each other forever.
+    """
+
+    @pytest.mark.parametrize(
+        "ctx_chunk_config",
+        [None, (ContextChunkingPolicy.FORCE_CHUNK, 64)],
+        ids=["full", "chunked"],
+    )
+    def test_out_of_pages_suspends_newer_started_request(self, ctx_chunk_config):
+        mgr = make_kv_cache_manager(resize_context_fn=_out_of_pages_for(0), can_evict=True)
+        sched = make_scheduler(mgr, max_num_tokens=1000, ctx_chunk_config=ctx_chunk_config)
+        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
+
+        out = sched.schedule_request([_started_context(0), victim], set())
+
+        mgr.suspend_request.assert_called_once_with(victim)
+        mgr.preempt_request.assert_not_called()
+        assert ids(out.paused_requests) == [99]
+        assert ids(out.recompute_paused_requests) == []
+        # The pages are reserved for the request that asked for them, which
+        # takes them on the next pass.
+        assert ids(out.context_requests) == []
+
+    def test_two_prefills_filling_the_pool_both_complete(self):
+        held = {0: 64, 1: 64}
+        managers, prepare_context, resize_context = _make_gpu_pool(128, held)
+        mgr = make_kv_cache_manager(
+            prepare_context_fn=prepare_context, resize_context_fn=resize_context, can_evict=True
+        )
+        managers.append(mgr)
+        sched = make_scheduler(
+            mgr, max_num_tokens=1024, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 64)
+        )
+        sched._DEADLOCK_STALL_ITERS = 3
+        older, newer = _started_context(0), _started_context(1)
+        for req in (older, newer):
+            req.context_current_position = 64
+            req.expect_snapshot_points = [128]
+
+        out = sched.schedule_request([older, newer], set())
+        assert ids(out.paused_requests) == [1]
+        assert ids(out.context_requests) == []
+
+        out = sched.schedule_request([older, newer], set())
+        assert ids(out.context_requests) == [0]
+        assert not mgr.kv_cache_map[1].is_active
+
+        # The older request leaves and returns its pages: the newer one
+        # resumes where it stopped.
+        del held[0]
+        out = sched.schedule_request([newer], set())
+        assert ids(out.context_requests) == [1]
+        assert held[1] == 128
+        mgr.preempt_request.assert_not_called()
+
+    def test_an_older_request_is_never_suspended(self):
+        """It would retake the pages on its next pass."""
+        mgr = make_kv_cache_manager(resize_context_fn=_out_of_pages_for(1), can_evict=True)
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+
+        out = sched.schedule_request([_started_context(0), _started_context(1)], set())
+
+        mgr.suspend_request.assert_not_called()
+        assert ids(out.context_requests) == [0]
+
+    def test_an_older_generation_request_is_never_suspended(self):
+        mgr = make_kv_cache_manager(resize_context_fn=_out_of_pages_for(1), can_evict=True)
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+
+        out = sched.schedule_request([make_gen_request(0), _started_context(1)], set())
+
+        mgr.suspend_request.assert_not_called()
+        assert ids(out.generation_requests) == [0]
+
+    def test_a_newer_generation_request_is_suspended(self):
+        mgr = make_kv_cache_manager(resize_context_fn=_out_of_pages_for(0), can_evict=True)
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        # Left out of this pass by its beam width, so nothing protects it.
+        victim = make_gen_request(99, beam_width=2)
+
+        out = sched.schedule_request([make_gen_request(5), _started_context(0), victim], set())
+
+        mgr.suspend_request.assert_called_once_with(victim)
+        assert ids(out.generation_requests) == [5]
+        assert ids(out.paused_requests) == [99]
+
+    @pytest.mark.parametrize(
+        "disqualify",
+        [
+            pytest.param(lambda mgr, victim: {99}, id="it_has_a_forward_in_flight"),
+            pytest.param(
+                lambda mgr, victim: setattr(mgr.kv_cache_map[99], "is_active", False) or set(),
+                id="it_is_already_suspended",
+            ),
+            pytest.param(
+                lambda mgr, victim: setattr(victim, "is_first_context_chunk", True) or set(),
+                id="it_has_not_started",
+            ),
+        ],
+    )
+    def test_what_disqualifies_a_suspension_victim(self, disqualify):
+        mgr = make_kv_cache_manager(resize_context_fn=_out_of_pages_for(0), can_evict=True)
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
+        inflight = disqualify(mgr, victim)
+
+        out = sched.schedule_request([_started_context(0), victim], inflight)
+
+        mgr.suspend_request.assert_not_called()
+        mgr.preempt_request.assert_not_called()
+        assert ids(out.paused_requests) == []
+
+    def test_a_completing_request_is_not_suspended(self):
+        mgr = make_kv_cache_manager(resize_context_fn=_out_of_pages_for(0), can_evict=True)
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        completing = make_gen_request(99)
+        completing.state_value = GEN_TO_COMPLETE
+
+        out = sched.schedule_request([_started_context(0), completing], set())
+
+        mgr.suspend_request.assert_not_called()
+        assert ids(out.paused_requests) == []
+
+    def test_without_a_lower_tier_nothing_is_suspended(self):
+        """Suspension would free nothing: the victim is released instead."""
+        mgr = make_kv_cache_manager(
+            resize_context_fn=_out_of_pages_for(0), can_evict=True, has_cache_tier_below_gpu=False
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
+
+        out = sched.schedule_request([_started_context(0), victim], set())
+
+        mgr.suspend_request.assert_not_called()
+        assert ids(out.recompute_paused_requests) == [99]
+
+    @pytest.mark.parametrize(
+        "ctx_chunk_config",
+        [None, (ContextChunkingPolicy.FORCE_CHUNK, 64)],
+        ids=["full", "chunked"],
+    )
+    def test_a_failed_resume_suspends_a_newer_started_request(self, ctx_chunk_config):
+        """A suspended prefill must not wait behind the requests that took its pages."""
+        mgr = make_kv_cache_manager(
+            prepare_context_fn=lambda req, reuse_limit=None: req.py_request_id != 0,
+            can_evict=True,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000, ctx_chunk_config=ctx_chunk_config)
+        suspended = _started_context(0)
+        mgr.kv_cache_map[0].is_active = False
+        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
+
+        out = sched.schedule_request([suspended, victim], set())
+
+        mgr.suspend_request.assert_called_once_with(victim)
+        assert ids(out.paused_requests) == [99]
+        assert ids(out.context_requests) == []
+
+    def test_a_first_chunk_that_cannot_be_prepared_suspends_nothing(self):
+        """It may lack an index slot rather than pages."""
+        mgr = make_kv_cache_manager(
+            prepare_context_fn=lambda req, reuse_limit=None: req.py_request_id != 0,
+            can_evict=True,
+        )
+        sched = make_scheduler(
+            mgr, max_num_tokens=1000, ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 64)
+        )
+        victim = make_ctx_request(99, 100, is_first_context_chunk=False)
+
+        out = sched.schedule_request([make_ctx_request(0, 100), victim], set())
+
+        mgr.suspend_request.assert_not_called()
+        assert ids(out.context_requests) == [99]
+
+
+class TestContextPreemptionWithLowerTier:
+    """Releasing a suspended request whose pages could not leave the GPU.
+
+    The last resort once nothing is left to suspend, for example because the
+    lower tier is full.
+    """
+
+    @staticmethod
+    def _blocked_behind_a_suspended_request(**manager):
+        mgr = make_kv_cache_manager(
+            resize_context_fn=_out_of_pages_for(0), can_evict=True, **manager
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        suspended = make_ctx_request(99, 100, is_first_context_chunk=False)
+        mgr.kv_cache_map[99].is_active = False
+        # Its own resume keeps failing too.
+        mgr.prepare_context.side_effect = lambda req, reuse_limit=None: req.py_request_id != 99
+        return mgr, sched, [_started_context(0), suspended]
+
+    def test_a_stuck_suspended_request_is_released_after_a_stalled_pass(self):
+        mgr, sched, reqs = self._blocked_behind_a_suspended_request()
+
+        out = sched.schedule_request(reqs, set())
+        # Another request may still make progress in this pass.
+        mgr.preempt_request.assert_not_called()
+        assert ids(out.recompute_paused_requests) == []
+
+        out = sched.schedule_request(reqs, set())
+        mgr.preempt_request.assert_called_once_with(reqs[1])
+        assert ids(out.recompute_paused_requests) == [99]
+
+    def test_a_full_lower_tier_ends_in_a_release_not_in_a_suspension_loop(self):
+        """Suspended pages that cannot leave the GPU let their request resume at once."""
+        held = {0: 48, 1: 40, 2: 40}
+        # Nothing migrates: a suspended request keeps counting against the pool.
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: sum(held.values()) + n <= 128, can_evict=True
+        )
+        mgr.prepare_context.side_effect = lambda req, reuse_limit=None: (
+            setattr(mgr.kv_cache_map[req.py_request_id], "is_active", True) or True
+        )
+        mgr.preempt_request.side_effect = lambda req: held.pop(req.py_request_id) is not None
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        reqs = [_started_context(i) for i in range(3)]
+
+        outs = [sched.schedule_request(reqs, set()) for _ in range(4)]
+
+        # Newest first, then a pass where the suspended requests stay
+        # suspended and nothing moves, which is what arms the release.
+        assert [ids(out.paused_requests) for out in outs] == [[2], [1], [], []]
+        assert [ids(out.recompute_paused_requests) for out in outs] == [[], [], [], [2]]
+        assert not mgr.kv_cache_map[1].is_active
+
+    def test_it_waits_for_an_active_generation_request(self):
+        """Its pages come back when it finishes."""
+        mgr, sched, reqs = self._blocked_behind_a_suspended_request()
+        generating = make_gen_request(5)
+
+        for _ in range(4):
+            # In flight, so the pass schedules nothing and stalls.
+            out = sched.schedule_request([generating, *reqs], {5})
+            assert ids(out.recompute_paused_requests) == []
+        mgr.preempt_request.assert_not_called()
+
+    def test_only_a_newer_request_is_released(self):
+        """Two requests that cannot proceed: the older one keeps its prefill."""
+        mgr = make_kv_cache_manager(resize_context_fn=_out_of_pages_for(1), can_evict=True)
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        mgr.kv_cache_map[0].is_active = False
+        mgr.prepare_context.side_effect = lambda req, reuse_limit=None: req.py_request_id != 0
+        older, newer = _started_context(0), _started_context(1)
+
+        released = []
+        for _ in range(4):
+            out = sched.schedule_request([older, newer], set())
+            released += ids(out.recompute_paused_requests)
+
+        assert released == [1]
+        mgr.preempt_request.assert_called_once_with(newer)
+
+    def test_a_request_that_cannot_fit_alone_is_still_a_deadlock(self):
+        mgr = make_kv_cache_manager(resize_context_fn=lambda req, n: False, can_evict=True)
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        sched._DEADLOCK_STALL_ITERS = 3
+        reqs = [_started_context(0)]
+
+        for _ in range(2):
+            sched.schedule_request(reqs, set())
+        with pytest.raises(RuntimeError, match="A single request may not fit the GPU pool"):
+            sched.schedule_request(reqs, set())
 
 
 # ===========================================================================
