@@ -1068,6 +1068,12 @@ class DecoderRunner(ScheduledModelRunner):
                             "row stride and would modify another request's packed logits after "
                             "a short verify window"
                         )
+                    if is_context_request and not request.is_last_context_chunk:
+                        # Only the last chunk of a context samples a token: the row of
+                        # an earlier chunk is discarded, and a stateful processor must
+                        # see one call per sampled token.
+                        logits_row_offset += row_stride
+                        continue
                     if is_context_request:
                         token_ids = [request.get_tokens(0)]
                     elif (histories := beam_histories.get(id(request))) is not None:
@@ -1075,10 +1081,6 @@ class DecoderRunner(ScheduledModelRunner):
                         token_ids = [prompt + history for history in histories]
                     else:
                         token_ids = [request.get_tokens(beam_idx) for beam_idx in range(beam_width)]
-                    if is_context_request and request.py_orig_prompt_len < len(token_ids[0]):
-                        # Skip as we only need to apply logit processor on the last context request
-                        logits_row_offset += row_stride
-                        continue
 
                     self._apply_logits_processors(
                         request,

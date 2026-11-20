@@ -894,6 +894,79 @@ def test_forward_warmup_runs_local_call_state_in_forward_context() -> None:
     assert get_model_extra_attrs() is None
 
 
+class _RecordingLogitsProcessor:
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, list[list[int]]]] = []
+
+    def __call__(self, req_id, logits, token_ids, stream_ptr, client_id) -> None:
+        self.calls.append((req_id, [list(ids) for ids in token_ids]))
+        logits += 1.0
+
+
+def _logits_processor_request(
+    req_id: int,
+    processor: _RecordingLogitsProcessor,
+    tokens: list[int],
+    *,
+    orig_prompt_len: int,
+    is_last_context_chunk: bool = True,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        py_request_id=req_id,
+        py_logits_post_processors=[processor],
+        py_orig_prompt_len=orig_prompt_len,
+        py_prompt_len=orig_prompt_len,
+        py_beam_width=1,
+        py_verify_len=None,
+        is_last_context_chunk=is_last_context_chunk,
+        get_tokens=lambda beam_idx: list(tokens),
+        get_beam_width_by_iter=lambda for_next_iteration: 1,
+    )
+
+
+def _execute_logit_post_processors(batch: ScheduledRequests, logits: torch.Tensor) -> None:
+    runner = SimpleNamespace(
+        _mapping=Mapping(), _apply_logits_processors=DecoderRunner._apply_logits_processors
+    )
+    DecoderRunner._execute_logit_post_processors(runner, batch, {"logits": logits})
+
+
+@pytest.mark.cpu_only
+def test_logit_post_processors_skip_non_last_context_chunks() -> None:
+    processor = _RecordingLogitsProcessor()
+    prompt = list(range(10))
+    batch = ScheduledRequests()
+    batch.append_context_request(
+        _logits_processor_request(0, processor, prompt, orig_prompt_len=10, is_last_context_chunk=False)
+    )
+    batch.append_context_request(_logits_processor_request(1, processor, prompt, orig_prompt_len=10))
+    batch.append_generation_request(
+        _logits_processor_request(2, processor, prompt + [10], orig_prompt_len=10)
+    )
+    logits = torch.zeros(3, 8)
+
+    _execute_logit_post_processors(batch, logits)
+
+    # A non-last chunk samples nothing: its row is left as is and its processor is not called.
+    assert [req_id for req_id, _ in processor.calls] == [1, 2]
+    assert logits.sum(dim=-1).tolist() == [0.0, 8.0, 8.0]
+
+
+@pytest.mark.cpu_only
+def test_logit_post_processors_run_on_last_chunk_of_a_replayed_context() -> None:
+    # A request prefilled again after a preemption holds its generated tokens in its context.
+    processor = _RecordingLogitsProcessor()
+    tokens = list(range(12))
+    batch = ScheduledRequests()
+    batch.append_context_request(_logits_processor_request(0, processor, tokens, orig_prompt_len=10))
+    logits = torch.zeros(1, 8)
+
+    _execute_logit_post_processors(batch, logits)
+
+    assert processor.calls == [(0, [tokens])]
+    assert logits.sum().item() == 8.0
+
+
 @pytest.mark.cpu_only
 def test_decoder_runner_forward_enters_model_context() -> None:
     engine, _, resources, _, _ = _make_decoder_runner(None)
